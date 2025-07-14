@@ -1,5 +1,5 @@
 # Semgeomo
-This is the official implement for the paper: Semgeomo: Dynamic contextual human motion generation with semantic and geometric guidance.
+Official implement for: (CVPR 2025) Semgeomo: Dynamic contextual human motion generation with semantic and geometric guidance.
 
 <br>
 <p align="center">
