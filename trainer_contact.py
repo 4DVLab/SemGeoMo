@@ -1,0 +1,558 @@
+import argparse
+import os
+import numpy as np
+import yaml
+import random
+import json 
+
+import trimesh 
+
+from tqdm import tqdm
+from pathlib import Path
+
+import torch
+import torch.nn as nn
+from torch.optim import Adam
+from torch.cuda.amp import autocast, GradScaler
+from torch.utils import data
+
+import torch.nn.functional as F
+
+import pytorch3d.transforms as transforms 
+
+from ema_pytorch import EMA
+from manip.data.hand_contact_data import HandContactDataset
+
+from manip.model.transformer_hand_foot_manip_cond_diffusion_model import CondGaussianDiffusion 
+
+from manip.vis.blender_vis_mesh_motion import run_blender_rendering_and_save2video, save_verts_faces_to_mesh_file_w_object
+
+from manip.model.transformer_fullbody_cond_diffusion_model import CondGaussianDiffusion as FullBodyCondGaussianDiffusion
+
+from eval_metric import compute_metrics, compute_s1_metrics, compute_collision
+
+from matplotlib import pyplot as plt
+
+import logging
+
+def cycle(dl):   #来遍历dl中所有数据
+    while True:
+        for data in dl:
+            yield data
+
+class Trainer(object):
+    def __init__(
+        self,
+        opt,
+        diffusion_model,
+        *,
+        ema_decay=0.995,
+        train_batch_size=32,
+        train_lr=1e-4,
+        train_num_steps=10000000,
+        gradient_accumulate_every=2,
+        amp=False,
+        step_start_ema=2000,
+        ema_update_every=10,
+        save_and_sample_every=3000,###
+        results_folder='./results',
+        use_wandb=False,  
+        datasettype = None
+    ):
+        super().__init__()
+
+        self.use_wandb = use_wandb           
+        if self.use_wandb:
+            # Loggers
+            wandb.init(config=opt, project=opt.wandb_pj_name, entity=opt.entity, \
+            name=opt.exp_name, dir=opt.save_dir)
+
+        self.model = diffusion_model
+        self.ema = EMA(diffusion_model, beta=ema_decay, update_every=ema_update_every)
+
+        self.step_start_ema = step_start_ema
+        self.save_and_sample_every = save_and_sample_every
+
+        self.batch_size = train_batch_size
+        self.gradient_accumulate_every = gradient_accumulate_every
+        self.train_num_steps = train_num_steps
+
+        self.optimizer = Adam(diffusion_model.parameters(), lr=train_lr)
+
+        self.step = 0
+
+        self.amp = amp
+        self.scaler = GradScaler(enabled=amp)
+
+        self.results_folder = results_folder
+
+        self.vis_folder = results_folder.replace("weights", "vis_res")
+
+        self.opt = opt 
+
+        self.window = opt.window
+
+        self.use_object_split = self.opt.use_object_split 
+
+        self.data_root_folder = self.opt.data_root_folder 
+        self.dataset_name = self.opt.dataset_name 
+
+        self.prep_dataloader(window_size=opt.window)
+
+        # self.bm_dict = self.ds.bm_dict 
+
+        self.test_on_train = self.opt.test_sample_res_on_train 
+
+        self.add_hand_processing = self.opt.add_hand_processing 
+
+        self.for_quant_eval = self.opt.for_quant_eval 
+
+        self.use_gt_hand_for_eval = self.opt.use_gt_hand_for_eval 
+        self.datasettype = self.opt.datasettype 
+        self.joint_together = self.opt.joint_together
+
+    def prep_dataloader(self, window_size):
+        # Define dataset
+        train_dataset = HandContactDataset(train=True, data_root_folder=self.data_root_folder, dataset_name=self.dataset_name,\
+            window=window_size, use_object_splits=self.use_object_split)
+        val_dataset = HandContactDataset(train=False, data_root_folder=self.data_root_folder, dataset_name=self.dataset_name,\
+            window=window_size, use_object_splits=self.use_object_split)
+
+        self.ds = train_dataset 
+        self.val_ds = val_dataset
+        self.dl = cycle(data.DataLoader(self.ds, batch_size=self.batch_size, \
+            shuffle=True, pin_memory=True, num_workers=0,drop_last = True))
+        self.val_dl = cycle(data.DataLoader(self.val_ds, batch_size=self.batch_size, \
+            shuffle=False, pin_memory=True, num_workers=0,drop_last = True))
+
+    def save(self, milestone):
+        data = {
+            'step': self.step,
+            'model': self.model.state_dict(),
+            'ema': self.ema.state_dict(),
+            'scaler': self.scaler.state_dict()
+        }
+        torch.save(data, os.path.join(self.results_folder, 'model-'+str(milestone)+'.pt'))
+
+    def load(self, pretrained_path=None):
+        if pretrained_path != "":
+            data = torch.load(pretrained_path)
+
+            self.step = data['step']
+            self.model.load_state_dict(data['model'], strict=False)
+            self.ema.load_state_dict(data['ema'], strict=False)
+            self.scaler.load_state_dict(data['scaler'])
+        else:
+            pass
+
+    def prep_temporal_condition_mask(self, data, t_idx=0):
+        # Missing regions are ones, the condition regions are zeros. 
+        mask = torch.ones_like(data).to(data.device) # BS X T X D 
+        mask[:, t_idx, :] = torch.zeros(data.shape[0], data.shape[2]).to(data.device) # BS X D  
+
+        return mask 
+
+    def train(self): ########################
+        init_step = self.step #0
+        for idx in range(init_step, self.train_num_steps): #0-400000
+            self.optimizer.zero_grad()
+
+            nan_exists = False # If met nan in loss or gradient, need to skip to next data. 
+            for i in range(self.gradient_accumulate_every): #gradient_accumulate_every=2 累积两次梯度再做参数更新
+                data_dict = next(self.dl)
+                joint_data = data_dict['joint'] 
+                bs, num_steps, _, _ = joint_data.shape 
+                lpalm_idx,rpalm_idx = 20,21
+                joint_data = torch.Tensor(np.concatenate((joint_data[:,:, lpalm_idx].reshape(bs, num_steps,1,3), 
+                                                    joint_data[:,:, rpalm_idx].reshape(bs, num_steps,1,3)),axis=2))\
+                                                        .reshape(bs, num_steps,-1).cuda()
+                # print(data_dict['dis'].shape,data_dict['dis'].dtype)        
+                # print("B=======",data_dict['dis'].shape)
+                data = data_dict['dis'].float().reshape(bs, num_steps, -1).cuda()
+                if self.joint_together:
+                    data = torch.cat((joint_data,data),-1)
+                obj_bps_data = data_dict['obj_bps'].reshape(bs, num_steps,-1).cuda() 
+                obj_com_pos = data_dict['obj_com_pos'].cuda() # BS X T X 3 
+                language = None
+                if opt.text:
+                    language = data_dict['text']
+                # print(language)
+                # print("==========",obj_bps_data.shape,obj_com_pos.shape)
+                ori_data_cond = torch.cat((obj_com_pos, obj_bps_data), dim=-1).float() # BS X T X (3+1024*3)
+                # print("ori_data_cond",ori_data_cond.shape,data.shape)
+
+                cond_mask = None 
+
+                # Generate padding mask 
+                actual_seq_len = data_dict['seq_len'] + 1 # BS, + 1 since we need additional timestep for noise level 
+                tmp_mask = torch.arange(self.window+1).expand(data.shape[0], self.window+1) < actual_seq_len[:, None].repeat(1, self.window+1)
+                # BS X max_timesteps
+                padding_mask = tmp_mask[:, None, :].to(data.device)
+
+                with autocast(enabled = self.amp):    
+                    loss_diffusion = self.model(data, ori_data_cond, cond_mask, padding_mask,text = language)
+                    
+                    loss = loss_diffusion
+
+                    if torch.isnan(loss).item():
+                        print('WARNING: NaN loss. Skipping to next data...')
+                        nan_exists = True 
+                        torch.cuda.empty_cache()
+                        continue
+
+                    self.scaler.scale(loss / self.gradient_accumulate_every).backward()
+
+                    # check gradients
+                    parameters = [p for p in self.model.parameters() if p.grad is not None]
+                    total_norm = torch.norm(torch.stack([torch.norm(p.grad.detach(), 2.0).to(data.device) for p in parameters]), 2.0)
+                    if torch.isnan(total_norm):
+                        print('WARNING: NaN gradients. Skipping to next data...')
+                        nan_exists = True 
+                        torch.cuda.empty_cache()
+                        continue
+
+                    if self.use_wandb:
+                        log_dict = {
+                            "Train/Loss/Total Loss": loss.item(),
+                            "Train/Loss/Diffusion Loss": loss_diffusion.item(),
+                        }
+                        wandb.log(log_dict)
+
+                    if idx % 50 == 0 and i == 0:
+                        print("Step: {0}".format(idx))
+                        print("Loss: %.4f" % (loss.item()))
+
+            if nan_exists:
+                continue
+
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+
+            self.ema.update()
+
+            if self.step != 0 and self.step % 10 == 0:
+                self.ema.ema_model.eval()
+
+                with torch.no_grad():
+                    val_data_dict = next(self.val_dl)
+                    val_joint = val_data_dict['joint']
+                    # val_joint = val_data_dict['motion'].cuda()
+
+                    bs, num_steps, _, _ = val_joint.shape 
+                   
+                    # val_joint = self.extract_palm_jpos_only_data(val_joint)
+                    lpalm_idx,rpalm_idx = 20,21
+                    val_data_joint = torch.Tensor(np.concatenate((val_joint[:,:, lpalm_idx].reshape(bs, num_steps,1,3), 
+                                                    val_joint[:,:, rpalm_idx].reshape(bs, num_steps,1,3)),axis=2))\
+                                                        .reshape(bs, num_steps,-1).float().cuda()
+                    # BS X T X (2*3) 
+
+                    val_data = val_data_dict['dis'].reshape(bs, num_steps, -1).float().cuda()
+                    if self.joint_together:
+                        val_data = torch.cat((val_data_joint,val_data),-1)
+                    
+                    obj_bps_data = val_data_dict['obj_bps'].reshape(bs, num_steps,-1).cuda() 
+                    obj_com_pos = val_data_dict['obj_com_pos'].cuda() # BS X T X 3 
+                    ori_data_cond = torch.cat((obj_com_pos, obj_bps_data), dim=-1).float() # BS X T X (3+1024*3)
+                    language = None
+                    if opt.text:
+                        language = data_dict['text']
+                    cond_mask = None 
+
+                    # Generate padding mask 
+                    actual_seq_len = val_data_dict['seq_len'] + 1 # BS, + 1 since we need additional timestep for noise level 
+                    tmp_mask = torch.arange(self.window+1).expand(val_data.shape[0], \
+                    self.window+1) < actual_seq_len[:, None].repeat(1, self.window+1)
+                    # BS X max_timesteps
+                    padding_mask = tmp_mask[:, None, :].to(val_data.device)
+
+                    # Get validation loss 
+                    # print(val_data.shape, ori_data_cond.shape)
+                    val_loss_diffusion = self.model(val_data, ori_data_cond, cond_mask, padding_mask,language)
+                    val_loss = val_loss_diffusion 
+                    if self.use_wandb:
+                        val_log_dict = {
+                            "Validation/Loss/Total Loss": val_loss.item(),
+                            "Validation/Loss/Diffusion Loss": val_loss_diffusion.item(),
+                        }
+                        wandb.log(val_log_dict)
+
+                    milestone = self.step // self.save_and_sample_every
+            
+                    bs_for_vis = 1
+
+                    if self.step % self.save_and_sample_every == 0:
+                        self.save(milestone)
+
+                        # all_res_list = self.ema.ema_model.sample(val_data, ori_data_cond, cond_mask, padding_mask,language)
+                        # all_res_list = all_res_list[:bs_for_vis]
+
+                        #self.gen_vis_res(all_res_list, val_data_dict, self.step, vis_tag="pred_jpos")
+
+            self.step += 1
+
+        print('training complete')
+
+        if self.use_wandb:
+            wandb.run.finish()
+
+    
+    def extract_palm_jpos_only_data(self, data_input):
+        # data_input: BS X T X D (22*3+22*6)
+        lpalm_idx = 22   ##22
+        rpalm_idx = 23 #####23
+        data_input = torch.cat((data_input[:, :, lpalm_idx*3:lpalm_idx*3+3], \
+                data_input[:, :, rpalm_idx*3:rpalm_idx*3+3]), dim=-1)
+        # BS X T X (2*3)
+
+        return data_input 
+
+    def create_ball_mesh(self, center_pos, ball_mesh_path):
+        # center_pos: 4(2) X 3  
+        lhand_color = np.asarray([255, 87, 51])  # red 
+        rhand_color = np.asarray([17, 99, 226]) # blue
+        lfoot_color = np.asarray([134, 17, 226]) # purple 
+        rfoot_color = np.asarray([22, 173, 100]) # green 
+
+        color_list = [lhand_color, rhand_color, lfoot_color, rfoot_color]
+
+        num_mesh = center_pos.shape[0]
+        for idx in range(num_mesh):
+            ball_mesh = trimesh.primitives.Sphere(radius=0.05, center=center_pos[idx])
+            
+            dest_ball_mesh = trimesh.Trimesh(
+                vertices=ball_mesh.vertices,
+                faces=ball_mesh.faces,
+                vertex_colors=color_list[idx],
+                process=False)
+
+            result = trimesh.exchange.ply.export_ply(dest_ball_mesh, encoding='ascii')
+            output_file = open(ball_mesh_path.replace(".ply", "_"+str(idx)+".ply"), "wb+")
+            output_file.write(result)
+            output_file.close()
+
+    def export_to_mesh(self, mesh_verts, mesh_faces, mesh_path):
+        dest_mesh = trimesh.Trimesh(
+            vertices=mesh_verts,
+            faces=mesh_faces,
+            process=False)
+
+        result = trimesh.exchange.ply.export_ply(dest_mesh, encoding='ascii')
+        output_file = open(mesh_path, "wb+")
+        output_file.write(result)
+        output_file.close()
+
+    def process_hand_foot_contact_jpos(self, hand_foot_jpos, object_mesh_verts, object_mesh_faces, obj_rot):
+        # hand_foot_jpos: T X 2 X 3 
+        # object_mesh_verts: T X Nv X 3 
+        # object_mesh_faces: Nf X 3 
+        # obj_rot: T X 3 X 3 
+        all_contact_labels = []
+        all_object_c_idx_list = []
+        all_dist = []
+
+        obj_rot = torch.from_numpy(obj_rot).to(hand_foot_jpos.device)
+        object_mesh_verts = object_mesh_verts.to(hand_foot_jpos.device)
+
+        num_joints = hand_foot_jpos.shape[1]
+        num_steps = hand_foot_jpos.shape[0]
+
+        threshold = 0.03 # Use palm position, should be smaller. 
+       
+        joint2object_dist = torch.cdist(hand_foot_jpos, object_mesh_verts.to(hand_foot_jpos.device)) # T X 2 X Nv 
+     
+        all_dist, all_object_c_idx_list = joint2object_dist.min(dim=2) # T X 2
+        all_contact_labels = all_dist < threshold # T X 2
+
+        new_hand_foot_jpos = hand_foot_jpos.clone() # T X 2 X 3 
+
+        # For each joint, scan the sequence, if contact is true, then use the corresponding object idx for the 
+        # rest of subsequence in contact. 
+        for j_idx in range(num_joints):
+            continue_prev_contact = False 
+            for t_idx in range(num_steps):
+                if continue_prev_contact:
+                    relative_rot_mat = torch.matmul(obj_rot[t_idx], reference_obj_rot.inverse())
+                    curr_contact_normal = torch.matmul(relative_rot_mat, contact_normal[:, None]).squeeze(-1)
+
+                    new_hand_foot_jpos[t_idx, j_idx] = object_mesh_verts[t_idx, subseq_contact_v_id] + \
+                        curr_contact_normal  # 3  
+                
+                elif all_contact_labels[t_idx, j_idx] and not continue_prev_contact: # The first contact frame 
+                    subseq_contact_v_id = all_object_c_idx_list[t_idx, j_idx]
+                    subseq_contact_pos = object_mesh_verts[t_idx, subseq_contact_v_id] # 3 
+
+                    contact_normal = new_hand_foot_jpos[t_idx, j_idx] - subseq_contact_pos # Keep using this in the following frames. 
+
+                    reference_obj_rot = obj_rot[t_idx] # 3 X 3 
+
+                    continue_prev_contact = True 
+
+        return new_hand_foot_jpos 
+
+    def gen_vis_res(self, all_res_list, data_dict, step, vis_gt=False, vis_tag=None):
+        # all_res_list: BS X T X 12  
+        lhand_color = np.asarray([255, 87, 51])  # red 
+        rhand_color = np.asarray([17, 99, 226]) # blue
+        lfoot_color = np.asarray([134, 17, 226]) # purple 
+        rfoot_color = np.asarray([22, 173, 100]) # green 
+
+        contact_pcs_colors = []
+        contact_pcs_colors.append(lhand_color)
+        contact_pcs_colors.append(rhand_color)
+        contact_pcs_colors.append(lfoot_color)
+        contact_pcs_colors.append(rfoot_color)
+        contact_pcs_colors = np.asarray(contact_pcs_colors) # 4 X 3 
+        
+        seq_names = data_dict['seq_name'] # BS 
+        seq_len = data_dict['seq_len'].detach().cpu().numpy() # BS 
+
+        # obj_rot = data_dict['obj_rot_mat'][:all_res_list.shape[0]].to(all_res_list.device) # BS X T X 3 X 3
+        obj_com_pos = data_dict['obj_com_pos'][:all_res_list.shape[0]].to(all_res_list.device) # BS X T X 3 
+
+        num_seq, num_steps, _ = all_res_list.shape
+        
+        normalized_gt_hand_foot_pos = self.extract_palm_jpos_only_data(data_dict['motion']) 
+        # Denormalize hand only 
+        pred_hand_foot_pos = self.ds.de_normalize_jpos_min_max_hand_foot(all_res_list, hand_only=True) # BS X T X 2 X 3 
+        gt_hand_foot_pos = self.ds.de_normalize_jpos_min_max_hand_foot(normalized_gt_hand_foot_pos, hand_only=True) # BS X T X 2 X 3
+        gt_hand_foot_pos = gt_hand_foot_pos.reshape(-1, num_steps, 2, 3) 
+        
+        all_processed_hand_jpos = pred_hand_foot_pos.clone() 
+
+        for seq_idx in range(num_seq):
+            object_name = seq_names[seq_idx].split("_")[1]
+            obj_scale = data_dict['obj_scale'][seq_idx].detach().cpu().numpy()
+            obj_trans = data_dict['obj_trans'][seq_idx].detach().cpu().numpy()
+            obj_rot = data_dict['obj_rot_mat'][seq_idx].detach().cpu().numpy() 
+            if object_name in ["mop", "vacuum"]:
+                obj_bottom_scale = data_dict['obj_bottom_scale'][seq_idx].detach().cpu().numpy() 
+                obj_bottom_trans = data_dict['obj_bottom_trans'][seq_idx].detach().cpu().numpy()
+                obj_bottom_rot = data_dict['obj_bottom_rot_mat'][seq_idx].detach().cpu().numpy()
+            else:
+                obj_bottom_scale = None 
+                obj_bottom_trans = None 
+                obj_bottom_rot = None 
+
+            obj_mesh_verts, obj_mesh_faces = self.ds.load_object_geometry(object_name, \
+            obj_scale, obj_trans, obj_rot, \
+            obj_bottom_scale, obj_bottom_trans, obj_bottom_rot)
+
+            # Add postprocessing for hand positions. 
+            if self.add_hand_processing:
+                curr_seq_pred_hand_foot_jpos = self.process_hand_foot_contact_jpos(pred_hand_foot_pos[seq_idx], \
+                                    obj_mesh_verts, obj_mesh_faces, obj_rot)
+
+                all_processed_hand_jpos[seq_idx] = curr_seq_pred_hand_foot_jpos 
+            else:
+                curr_seq_pred_hand_foot_jpos = pred_hand_foot_pos[seq_idx]
+
+        if self.use_gt_hand_for_eval:
+            all_processed_hand_jpos = self.ds.normalize_jpos_min_max_hand_foot(gt_hand_foot_pos.cuda())
+        else:
+            all_processed_hand_jpos = self.ds.normalize_jpos_min_max_hand_foot(all_processed_hand_jpos) # BS X T X 4 X 3 
+
+        gt_hand_foot_pos = self.ds.normalize_jpos_min_max_hand_foot(gt_hand_foot_pos.cuda())
+
+        return all_processed_hand_jpos, gt_hand_foot_pos  
+
+def run_train(opt, device):
+    # Prepare Directories
+    save_dir = Path(opt.save_dir)
+    wdir = save_dir / 'weights'
+    wdir.mkdir(parents=True, exist_ok=True)
+
+    # Save run settings
+    with open(save_dir / 'opt.yaml', 'w') as f:
+        yaml.safe_dump(vars(opt), f, sort_keys=True)
+    
+    repr_dim = 2 * 1024 # 2*512 for behave
+
+    if opt.joint_together:
+        repr_dim = 2 * 3 # for seperate joint+aff diffusion
+   
+    loss_type = "l1"
+  
+    diffusion_model = CondGaussianDiffusion(opt, d_feats=repr_dim, d_model=opt.d_model, \
+                n_dec_layers=opt.n_dec_layers, n_head=opt.n_head, d_k=opt.d_k, d_v=opt.d_v, \
+                max_timesteps=opt.window+1, out_dim=repr_dim, timesteps=1000, \
+                objective="pred_x0", loss_type=loss_type, \
+                batch_size=opt.batch_size,text = opt.text)
+   
+    diffusion_model.to(device)
+
+    trainer = Trainer(
+        opt,
+        diffusion_model,
+        train_batch_size=opt.batch_size, # 32
+        train_lr=opt.learning_rate, # 1e-4
+        train_num_steps=400000,         # 700000, total training steps
+        gradient_accumulate_every=2,    # gradient accumulation steps
+        ema_decay=0.995,                # exponential moving average decay
+        amp=True,                        # turn on mixed precision
+        results_folder=str(wdir)
+    )
+    trainer.load(pretrained_path=opt.checkpoint)
+    trainer.train()
+
+    torch.cuda.empty_cache()
+
+
+def parse_opt():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--project', default='runs/train', help='output folder for weights and visualizations')
+    parser.add_argument('--wandb_pj_name', type=str, default='wandb_proj_name', help='wandb project name')
+    parser.add_argument('--entity', default='wandb_account_name', help='W&B entity')
+    parser.add_argument('--exp_name', default='stage1_exp_out', help='save to project/exp_name')
+    parser.add_argument('--device', default='0', help='cuda device')
+
+    parser.add_argument('--fullbody_exp_name', default='test_exp_with_eval', help='project/fullbody_exp_name')
+    parser.add_argument('--fullbody_checkpoint', type=str, default="", help='checkpoint')
+
+    parser.add_argument('--window', type=int, default=120, help='horizon')
+
+    parser.add_argument('--batch_size', type=int, default=32, help='batch size')
+    parser.add_argument('--learning_rate', type=float, default=2e-4, help='generator_learning_rate')
+
+    parser.add_argument('--checkpoint', type=str, default="", help='checkpoint')
+
+    parser.add_argument('--n_dec_layers', type=int, default=4, help='the number of decoder layers')
+    parser.add_argument('--n_head', type=int, default=4, help='the number of heads in self-attention')
+    parser.add_argument('--d_k', type=int, default=256, help='the dimension of keys in transformer')
+    parser.add_argument('--d_v', type=int, default=256, help='the dimension of values in transformer')
+    parser.add_argument('--d_model', type=int, default=512, help='the dimension of intermediate representation in transformer')
+    
+    # For testing sampled results 
+    parser.add_argument("--test_sample_res", action="store_true")
+
+    # For testing sampled results on training dataset 
+    parser.add_argument("--test_sample_res_on_train", action="store_true")
+
+    # For running the whole pipeline. 
+    parser.add_argument("--run_whole_pipeline", action="store_true")
+
+    parser.add_argument("--add_hand_processing", action="store_true")
+
+    parser.add_argument("--for_quant_eval", action="store_true")
+
+    parser.add_argument("--use_gt_hand_for_eval", action="store_true")
+
+    parser.add_argument("--use_object_split", action="store_true")
+
+    parser.add_argument("--dataset_name", default="behave")
+    parser.add_argument('--data_root_folder', default="", help='root folder for dataset')
+
+    parser.add_argument('--datasettype',  default=None)
+    parser.add_argument('--text',  default=True)
+    parser.add_argument('--joint_together',  default=True)
+    opt = parser.parse_args()
+    return opt
+
+if __name__ == "__main__":
+    opt = parse_opt()
+    # print("data_root_folder---",opt.data_root_folder)
+    opt.save_dir = os.path.join(opt.project, opt.exp_name)
+    print(opt.joint_together)
+    opt.exp_name = opt.save_dir.split('/')[-1]
+    device = torch.device(f"cuda:{opt.device}" if torch.cuda.is_available() else "cpu")
+    run_train(opt, device)

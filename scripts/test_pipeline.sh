@@ -1,0 +1,13 @@
+python sample_pipeline.py  \
+--window=100 \
+--batch_size=1 \
+--project="./exp" \
+--exp_name="omomo-pipeline" \
+--dataset_name="omomo" \
+--run_whole_pipeline \
+--test_sample_res \
+--checkpoint="/storage/group/4dvlab/wangzy/SemGeoMo/exp/omomo-stage1/weights/model-35.pt" \
+--model_path="/storage/group/4dvlab/wangzy/SemGeoMo/exp/omomo-stage2-new/model000100000.pt" \
+--text=True \
+--for_quant_eval \
+--use_posterior 

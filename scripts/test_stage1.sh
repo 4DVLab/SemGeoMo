@@ -1,0 +1,12 @@
+python sample_stage1.py  \
+--window=100 \
+--batch_size=64 \
+--project="./exp" \
+--exp_name="omomo-stage1" \
+--add_hand_processing \
+--test_sample_res \
+--dataset_name="omomo" \
+--checkpoint="exp/omomo-stage1/weights/model-13.pt" \
+--for_quant_eval \
+--text=True \
+--joint_together=True \
