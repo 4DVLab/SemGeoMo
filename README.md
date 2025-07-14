@@ -16,15 +16,11 @@ Official implement for: (CVPR 2025) Semgeomo: Dynamic contextual human motion ge
 - [Data Preparation](#data-preparation)
 - [Training](#training)
 - [Testing](#testing)
-- [Evaluation](#evaluation)
-- [Citation](#citation)
 
 ## Installation
 
 ### Prerequisites
-- Python 3.8+
-- CUDA 11.0+
-- PyTorch 1.8+
+- Python 3.8+, CUDA 11.0+, PyTorch 1.8+
 
 ### Environment Setup 🛠️
 
