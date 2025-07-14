@@ -10,9 +10,6 @@ This is the official implement for the paper: Semgeomo: Dynamic contextual human
   <a href="https://arxiv.org/pdf/2503.01291"><b>📄 Arxiv Paper </b></a> |
 </p>
 
-<div align="center">
-    <img src="teasor.png" alt="Directional Weight Score" class="blend-img-background center-image" style="max-width: 100%; height: auto;" />
-</div>
 
 ## Table of Contents
 - [Installation](#installation)
@@ -47,9 +44,7 @@ conda activate semgeomo
 ```bash
 pip install -r requirements.txt
 ```
-Download **Long_CLIP** package from https://github.com/beichenzbc/Long-CLIP.git.
-
-Download **Pytorch3d** package from https://github.com/facebookresearch/pytorch3d.git
+Download **[Long_CLIP](https://github.com/beichenzbc/Long-CLIP.git)** and **[Pytorch3d](https://github.com/facebookresearch/pytorch3d.git)** package.
 
 
 ## Data Preparation 
@@ -80,7 +75,7 @@ motion_dict[name] = {
 
 **Note**: If this is your first time training Stage 1, the `manip/data/hand_contact_data.py` will automatically process the original data into .pkl files. Preprocessed .pkl files are already available in the `/data_pkl` folder.
 
-* Download relative package and models from the **Google Drive link**:"https://drive.google.com/drive/folders/1iKANCKEV_FdAwv_0KNJ0JIDEAOIext30?usp=sharing"
+* Download relative package and models from the **[Google Drive.](https://drive.google.com/drive/folders/1iKANCKEV_FdAwv_0KNJ0JIDEAOIext30?usp=sharing)**
 
 
 * Data Structure
@@ -217,4 +212,4 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## Acknowledgments
 
-We thank the authors of MDM and other related works for their contributions to the field.
+We thank the authors of [MDM](https://github.com/GuyTevet/motion-diffusion-model), [OMOMO](https://lijiaman.github.io/projects/omomo/), [InterControl](https://github.com/zhenzhiwang/intercontrol) and other related works for their contributions to the field.
