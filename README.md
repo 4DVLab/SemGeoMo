@@ -30,15 +30,9 @@ git clone https://github.com/your-repo/SemGeoMo.git
 cd SemGeoMo
 ```
 
-2. Create and activate conda environment:
-```bash
-conda create -n semgeomo python=3.8
-conda activate semgeomo
+2. Create and create environment:
 ```
-
-3. Install dependencies:
-```bash
-pip install -r requirements.txt
+conda env create -f environment.yml
 ```
 Download **[Long_CLIP](https://github.com/beichenzbc/Long-CLIP.git)** and **[Pytorch3d](https://github.com/facebookresearch/pytorch3d.git)** package.
 
